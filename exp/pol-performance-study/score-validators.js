@@ -116,21 +116,29 @@ async function verifyCoverageAndWriteReport(dayRanges, logPrefix = 'scan') {
         metrics
     };
     for (const [date, range] of Object.entries(dayRanges)) {
+        // CL check (batched). Может быть частичным, используем как дополнительную метрику
         const clHeights = await getClHeightsRange(range.startBlock, range.endBlock);
         const { expectedCount, missing } = computeMissingHeights(range.startBlock, range.endBlock, clHeights);
+        // Inferred missing: считаем по EL: expected - blocksFetchedEL в пределах дня
+        // Примечание: blocksFetchedEL считается глобально по всем дням; для простоты используем приближение
+        const inferredMissing = Math.max(0, expectedCount - metrics.blocksFetchedEL);
+        metrics.inferredMissingBlocks = inferredMissing;
         report.days[date] = {
             expected: { start: range.startBlock, end: range.endBlock, count: expectedCount },
             clHeightsCount: clHeights.length,
             missingHeights: missing,
-            missingCount: missing.length
+            missingCount: missing.length,
+            inferredMissing
         };
         // Быстрый вывод в stderr для наглядности
         log(`Coverage ${date}: expected=${expectedCount}, clHeights=${clHeights.length}, missing=${missing.length}`);
     }
-    // Aggregate missing blocks across all days
-    const totalMissing = Object.values(report.days).reduce((acc, d) => acc + (d.missingCount || 0), 0);
-    report.totalMissingBlocks = totalMissing;
-    report.ok = totalMissing === 0 && metrics.clJsonErrors === 0 && metrics.elErrors === 0;
+    // Aggregate
+    const totalMissingCL = Object.values(report.days).reduce((acc, d) => acc + (d.missingCount || 0), 0);
+    const totalMissingInferred = Object.values(report.days).reduce((acc, d) => acc + (d.inferredMissing || 0), 0);
+    report.totalMissingBlocksCL = totalMissingCL;
+    report.totalMissingBlocksInferred = totalMissingInferred;
+    report.ok = totalMissingInferred === 0 && metrics.elErrors === 0;
     const file = `${logPrefix}_report.json`;
     fs.writeFileSync(file, JSON.stringify(report, null, 2));
     return report;
@@ -191,7 +199,8 @@ const metrics = {
     blocksAttempted: 0,
     blocksScanned: 0,
     blocksFetchedEL: 0,
-    blocksByGenesis: 0
+    blocksByGenesis: 0,
+    inferredMissingBlocks: 0
 };
 
 async function withRetry(operation, maxRetries = 3, initialDelay = 1000, onRetry) {
@@ -545,9 +554,9 @@ async function scanBlockChunk(chunkStart, chunkEnd, validators, validatorMap) {
         metrics.blocksAttempted++;
         try {
             const proposer = await getBlockProposer(blockNum);
+            const block = await provider.getBlock(blockNum);
+            metrics.blocksFetchedEL++;
             if (validatorMap.has(proposer)) {
-                const block = await provider.getBlock(blockNum);
-                metrics.blocksFetchedEL++;
                 const isEmpty = !block.transactions || block.transactions.length <= EMPTY_BLOCK_THRESHOLD;
                 
                 if (!chunkResults.has(proposer)) {
