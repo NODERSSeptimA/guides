@@ -69,14 +69,53 @@ async function clFetchJson(path) {
         const contentType = response.headers.get('content-type') || '';
         if (!response.ok || !contentType.includes('application/json')) {
             const body = await response.text().catch(() => '');
+            metrics.clJsonErrors++;
             throw new Error(`CL fetch failed ${response.status} ${response.statusText}; ct=${contentType}; body=${body.slice(0,120)}`);
         }
         const data = await response.json();
         if (data && data.error) {
+            metrics.clJsonErrors++;
             throw new Error(data.error.message || 'CL JSON error');
         }
         return data;
-    }, 3, 500);
+    }, 3, 500, () => { metrics.retries++; });
+}
+
+// Coverage verification using CL /blockchain
+async function getClHeightsRange(minHeight, maxHeight) {
+    const data = await clFetchJson(`/blockchain?minHeight=${minHeight}&maxHeight=${maxHeight}`);
+    const metas = data?.result?.block_metas || [];
+    return metas.map(m => parseInt(m?.header?.height || '0', 10)).filter(Boolean).sort((a,b)=>a-b);
+}
+
+function computeMissingHeights(expectedStart, expectedEnd, clHeights) {
+    const expectedCount = expectedEnd - expectedStart + 1;
+    const missing = [];
+    let idx = 0;
+    for (let h = expectedStart; h <= expectedEnd; h++) {
+        while (idx < clHeights.length && clHeights[idx] < h) idx++;
+        if (idx >= clHeights.length || clHeights[idx] !== h) missing.push(h);
+    }
+    return { expectedCount, missing };
+}
+
+async function verifyCoverageAndWriteReport(dayRanges, logPrefix = 'scan') {
+    const report = {
+        days: {},
+        metrics
+    };
+    for (const [date, range] of Object.entries(dayRanges)) {
+        const clHeights = await getClHeightsRange(range.startBlock, range.endBlock);
+        const { expectedCount, missing } = computeMissingHeights(range.startBlock, range.endBlock, clHeights);
+        report.days[date] = {
+            expected: { start: range.startBlock, end: range.endBlock, count: expectedCount },
+            clHeightsCount: clHeights.length,
+            missingHeights: missing
+        };
+    }
+    const file = `${logPrefix}_report.json`;
+    fs.writeFileSync(file, JSON.stringify(report, null, 2));
+    return report;
 }
 
 // Command line arguments
@@ -126,7 +165,16 @@ function logProgress(current, total, description = '') {
     if (current === total) process.stderr.write('\n');
 }
 
-async function withRetry(operation, maxRetries = 3, initialDelay = 1000) {
+// Global scan metrics
+const metrics = {
+    clJsonErrors: 0,
+    elErrors: 0,
+    retries: 0,
+    blocksAttempted: 0,
+    blocksScanned: 0
+};
+
+async function withRetry(operation, maxRetries = 3, initialDelay = 1000, onRetry) {
     let lastError;
     let delay = initialDelay;
 
@@ -138,6 +186,9 @@ async function withRetry(operation, maxRetries = 3, initialDelay = 1000) {
             if (error.message.includes('Fetch failed') || error.message.includes('ETIMEDOUT') || error.message.includes('ECONNRESET')) {
                 if (attempt < maxRetries) {
                     log(`Attempt ${attempt} failed, retrying in ${delay/1000}s...`);
+                    if (typeof onRetry === 'function') {
+                        try { onRetry(); } catch (_) {}
+                    }
                     await new Promise(resolve => setTimeout(resolve, delay));
                     delay *= 2;
                 }
@@ -918,11 +969,6 @@ async function main() {
         // Scan blocks for proposers and empty blocks
         log('\nScanning blocks for proposers and empty blocks...');
         
-        // Calculate total blocks to scan for progress bar
-        const totalBlocksToScan = Object.values(dayRanges).reduce((sum, range) => 
-            sum + (range.endBlock - range.startBlock + 1), 0
-        );
-        
         // Scan all day ranges
         const allBlockResults = new Map();
         for (const [date, range] of Object.entries(dayRanges)) {
@@ -949,6 +995,14 @@ async function main() {
         }
         
         const blockResults = allBlockResults;
+        
+        // Coverage verification and report
+        log('\nVerifying CL coverage with /blockchain...');
+        const coverage = await verifyCoverageAndWriteReport(dayRanges, 'validator_scan');
+        const hasMissing = Object.values(coverage.days).some(d => (d.missingHeights || []).length > 0);
+        if (hasMissing) {
+            log('Warning: missing heights detected. See validator_scan_report.json');
+        }
         
         // Collect stake and boost data
         const stakeBoostData = await collectStakeAndBoost(validators, dayBoundaries);
