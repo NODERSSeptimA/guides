@@ -83,9 +83,20 @@ async function clFetchJson(path) {
 
 // Coverage verification using CL /blockchain
 async function getClHeightsRange(minHeight, maxHeight) {
-    const data = await clFetchJson(`/blockchain?minHeight=${minHeight}&maxHeight=${maxHeight}`);
-    const metas = data?.result?.block_metas || [];
-    return metas.map(m => parseInt(m?.header?.height || '0', 10)).filter(Boolean).sort((a,b)=>a-b);
+    const windowSize = parseInt(process.env.CL_BLOCKCHAIN_WINDOW || '5000');
+    const all = [];
+    for (let start = minHeight; start <= maxHeight; start += windowSize) {
+        const end = Math.min(start + windowSize - 1, maxHeight);
+        const data = await clFetchJson(`/blockchain?minHeight=${start}&maxHeight=${end}`);
+        const metas = data?.result?.block_metas || [];
+        for (const m of metas) {
+            const h = parseInt(m?.header?.height || '0', 10);
+            if (h) all.push(h);
+        }
+    }
+    // unique + sort
+    const uniq = Array.from(new Set(all)).sort((a,b)=>a-b);
+    return uniq;
 }
 
 function computeMissingHeights(expectedStart, expectedEnd, clHeights) {
@@ -113,6 +124,8 @@ async function verifyCoverageAndWriteReport(dayRanges, logPrefix = 'scan') {
             missingHeights: missing,
             missingCount: missing.length
         };
+        // Быстрый вывод в stderr для наглядности
+        log(`Coverage ${date}: expected=${expectedCount}, clHeights=${clHeights.length}, missing=${missing.length}`);
     }
     // Aggregate missing blocks across all days
     const totalMissing = Object.values(report.days).reduce((acc, d) => acc + (d.missingCount || 0), 0);
@@ -176,7 +189,9 @@ const metrics = {
     elErrors: 0,
     retries: 0,
     blocksAttempted: 0,
-    blocksScanned: 0
+    blocksScanned: 0,
+    blocksFetchedEL: 0,
+    blocksByGenesis: 0
 };
 
 async function withRetry(operation, maxRetries = 3, initialDelay = 1000, onRetry) {
@@ -532,6 +547,7 @@ async function scanBlockChunk(chunkStart, chunkEnd, validators, validatorMap) {
             const proposer = await getBlockProposer(blockNum);
             if (validatorMap.has(proposer)) {
                 const block = await provider.getBlock(blockNum);
+                metrics.blocksFetchedEL++;
                 const isEmpty = !block.transactions || block.transactions.length <= EMPTY_BLOCK_THRESHOLD;
                 
                 if (!chunkResults.has(proposer)) {
@@ -540,6 +556,7 @@ async function scanBlockChunk(chunkStart, chunkEnd, validators, validatorMap) {
                 
                 chunkResults.get(proposer).blocks.push(blockNum);
                 metrics.blocksScanned++;
+                metrics.blocksByGenesis++;
                 if (isEmpty) {
                     chunkResults.get(proposer).emptyBlockNumbers.push(blockNum);
                 }
