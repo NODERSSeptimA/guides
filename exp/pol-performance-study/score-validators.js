@@ -110,9 +110,14 @@ async function verifyCoverageAndWriteReport(dayRanges, logPrefix = 'scan') {
         report.days[date] = {
             expected: { start: range.startBlock, end: range.endBlock, count: expectedCount },
             clHeightsCount: clHeights.length,
-            missingHeights: missing
+            missingHeights: missing,
+            missingCount: missing.length
         };
     }
+    // Aggregate missing blocks across all days
+    const totalMissing = Object.values(report.days).reduce((acc, d) => acc + (d.missingCount || 0), 0);
+    report.totalMissingBlocks = totalMissing;
+    report.ok = totalMissing === 0 && metrics.clJsonErrors === 0 && metrics.elErrors === 0;
     const file = `${logPrefix}_report.json`;
     fs.writeFileSync(file, JSON.stringify(report, null, 2));
     return report;
@@ -216,7 +221,7 @@ async function jsonRpcCall(url, method, params = []) {
         const data = await response.json();
         if (data.error) throw new Error(data.error.message);
         return data.result;
-    });
+    }, 3, 500, () => { metrics.retries++; });
 }
 
 async function getBlockProposer(blockHeight) {
@@ -230,8 +235,13 @@ async function getBlockProposer(blockHeight) {
 }
 
 async function getBlockTimestamp(blockNumber) {
-    const block = await nextElProvider().getBlock(blockNumber);
-    return block.timestamp;
+    try {
+        const block = await nextElProvider().getBlock(blockNumber);
+        return block.timestamp;
+    } catch (e) {
+        metrics.elErrors++;
+        throw e;
+    }
 }
 
 // Contract interaction functions
@@ -313,7 +323,7 @@ async function callContractFunction(contractAddress, functionSignature, params, 
         const rpcUrl = nextElUrl();
         const output = execSync(`cast call --rpc-url ${rpcUrl} --block ${blockNumber} ${contractAddress} "${functionSignature}" ${params.join(' ')}`, { encoding: 'utf8' });
         return output.trim();
-    });
+    }, 3, 500, () => { metrics.retries++; });
 }
 
 // Validator loading
@@ -517,6 +527,7 @@ async function scanBlockChunk(chunkStart, chunkEnd, validators, validatorMap) {
     const chunkResults = new Map();
     
     for (let blockNum = chunkStart; blockNum <= chunkEnd; blockNum++) {
+        metrics.blocksAttempted++;
         try {
             const proposer = await getBlockProposer(blockNum);
             if (validatorMap.has(proposer)) {
@@ -528,11 +539,13 @@ async function scanBlockChunk(chunkStart, chunkEnd, validators, validatorMap) {
                 }
                 
                 chunkResults.get(proposer).blocks.push(blockNum);
+                metrics.blocksScanned++;
                 if (isEmpty) {
                     chunkResults.get(proposer).emptyBlockNumbers.push(blockNum);
                 }
             }
         } catch (error) {
+            metrics.elErrors++;
             log(`Error at block ${blockNum}: ${error.message}`);
         }
     }
