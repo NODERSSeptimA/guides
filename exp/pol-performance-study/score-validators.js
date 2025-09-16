@@ -11,7 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // Configuration constants
-const CHUNK_SIZE = 200;
+const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || '200');
 const BLOCKS_PER_DAY = 43200; // Approximate, used for binary search estimates
 const EMPTY_BLOCK_THRESHOLD = 1; // Blocks with at least this many transactions are not empty
 const GENESIS_TIMESTAMP = 1737382451; // 2025-01-20 14:14:11 UTC
@@ -21,6 +21,63 @@ const TEST_BLOCKS_TO_SCAN = 5000; // Number of blocks to scan in test mode
 // Environment variables with defaults from old script
 const EL_ETHRPC_URL = process.env.EL_ETHRPC_URL || 'http://37.27.231.195:59830';
 const CL_ETHRPC_URL = process.env.CL_ETHRPC_URL || 'http://37.27.231.195:59820';
+const WORKERS_OVERRIDE = parseInt(process.env.WORKERS || '0');
+
+// Multi-RPC support (comma-separated lists)
+const EL_URLS = (process.env.EL_ETHRPC_URLS || EL_ETHRPC_URL)
+    .split(',')
+    .map(u => u.trim())
+    .filter(Boolean);
+const CL_URLS = (process.env.CL_ETHRPC_URLS || CL_ETHRPC_URL)
+    .split(',')
+    .map(u => u.trim())
+    .filter(Boolean);
+
+// Round-robin helpers
+let elIndex = 0;
+let clIndex = 0;
+function nextElUrl() {
+    const url = EL_URLS[elIndex % EL_URLS.length];
+    elIndex++;
+    return url;
+}
+function nextClUrl() {
+    const url = CL_URLS[clIndex % CL_URLS.length];
+    clIndex++;
+    return url;
+}
+
+// Provider pool for EL URLs
+const elProviders = EL_URLS.map(url => new ethers.JsonRpcProvider(url));
+let elProvIndex = 0;
+function nextElProvider() {
+    const provider = elProviders[elProvIndex % elProviders.length];
+    elProvIndex++;
+    return provider;
+}
+
+// CL fetch helper with content-type guard and retries via withRetry
+async function clFetchJson(path) {
+    return withRetry(async () => {
+        const url = `${nextClUrl()}${path}`;
+        const response = await fetch(url, {
+            headers: {
+                'Accept': 'application/json',
+                'User-Agent': 'pol-performance-study/1.0'
+            }
+        });
+        const contentType = response.headers.get('content-type') || '';
+        if (!response.ok || !contentType.includes('application/json')) {
+            const body = await response.text().catch(() => '');
+            throw new Error(`CL fetch failed ${response.status} ${response.statusText}; ct=${contentType}; body=${body.slice(0,120)}`);
+        }
+        const data = await response.json();
+        if (data && data.error) {
+            throw new Error(data.error.message || 'CL JSON error');
+        }
+        return data;
+    }, 3, 500);
+}
 
 // Command line arguments
 const args = process.argv.slice(2);
@@ -113,8 +170,7 @@ async function jsonRpcCall(url, method, params = []) {
 
 async function getBlockProposer(blockHeight) {
     return withRetry(async () => {
-        const response = await fetch(`${CL_ETHRPC_URL}/header?height=${blockHeight}`);
-        const data = await response.json();
+        const data = await clFetchJson(`/header?height=${blockHeight}`);
         if (!data.result?.header?.proposer_address) {
             throw new Error(`No proposer found for block ${blockHeight}`);
         }
@@ -123,8 +179,7 @@ async function getBlockProposer(blockHeight) {
 }
 
 async function getBlockTimestamp(blockNumber) {
-    const provider = new ethers.JsonRpcProvider(EL_ETHRPC_URL);
-    const block = await provider.getBlock(blockNumber);
+    const block = await nextElProvider().getBlock(blockNumber);
     return block.timestamp;
 }
 
@@ -136,17 +191,7 @@ async function getValidatorVotingPower(blockHeight) {
         const perPage = 100; // Use 100 instead of 99 for better pagination
         
         while (true) {
-            const response = await fetch(`${CL_ETHRPC_URL}/validators?height=${blockHeight}&per_page=${perPage}&page=${page}`);
-            if (!response.ok) {
-                log(`HTTP error ${response.status}: ${response.statusText} for block ${blockHeight} page ${page}`);
-                break;
-            }
-            
-            const data = await response.json();
-            if (data.error) {
-                log(`RPC error for block ${blockHeight} page ${page}: ${data.error.message}`);
-                break;
-            }
+            const data = await clFetchJson(`/validators?height=${blockHeight}&per_page=${perPage}&page=${page}`);
             
             if (!data.result?.validators || data.result.validators.length === 0) {
                 break; // No more validators
@@ -214,7 +259,8 @@ async function getValidatorBoost(validatorPubkey, blockNumber) {
 async function callContractFunction(contractAddress, functionSignature, params, blockNumber = 'latest') {
     return withRetry(async () => {
         const { execSync } = await import('child_process');
-        const output = execSync(`cast call --rpc-url ${EL_ETHRPC_URL} --block ${blockNumber} ${contractAddress} "${functionSignature}" ${params.join(' ')}`, { encoding: 'utf8' });
+        const rpcUrl = nextElUrl();
+        const output = execSync(`cast call --rpc-url ${rpcUrl} --block ${blockNumber} ${contractAddress} "${functionSignature}" ${params.join(' ')}`, { encoding: 'utf8' });
         return output.trim();
     });
 }
@@ -245,7 +291,7 @@ function loadValidators() {
 async function findDayBoundaries(dates) {
     log('Finding day boundary blocks...');
     let numGuesses = 0;
-    const provider = new ethers.JsonRpcProvider(EL_ETHRPC_URL);
+    const provider = nextElProvider();
     const latestBlock = await provider.getBlockNumber();
     const boundaries = {};
     const progress = createProgressBar(dates.length, 'Finding boundaries');
@@ -416,7 +462,7 @@ function createProgressBar(total, description = '') {
 
 // Block scanning worker
 async function scanBlockChunk(chunkStart, chunkEnd, validators, validatorMap) {
-    const provider = new ethers.JsonRpcProvider(EL_ETHRPC_URL);
+    const provider = nextElProvider();
     const chunkResults = new Map();
     
     for (let blockNum = chunkStart; blockNum <= chunkEnd; blockNum++) {
@@ -455,11 +501,11 @@ async function scanBlocksParallel(startBlock, endBlock, validators, validatorMap
     }
     
     const results = [];
-    const workerCount = Math.max(1, os.cpus().length - 1);
+    const workerCount = WORKERS_OVERRIDE > 0 ? WORKERS_OVERRIDE : Math.max(1, os.cpus().length - 1);
     
     for (let i = 0; i < chunks.length; i += workerCount) {
         const batch = chunks.slice(i, i + workerCount);
-        const batchPromises = batch.map(chunk => 
+        const batchPromises = batch.map((chunk, idx) => 
             scanBlockChunk(chunk.chunkStart, chunk.chunkEnd, validators, validatorMap)
         );
         
